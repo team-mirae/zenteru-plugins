@@ -22,8 +22,9 @@ palette.
   follows the shell like zenfinder does. Any file that starts with an obfus
   header is tagged `[obfus]`, whatever its name. A `.obfus` file without a
   valid header is tagged `[not obfus]`.
-- **Bottom: the preview.** It shows the unpacked contents: text,
-  image format and size, audio, video or PDF type, a hex dump, or an
+- **Bottom: the preview.** It shows the unpacked contents: the **picture
+  itself** for images and PDFs (zenteru 0.1.17+, sent straight from memory,
+  never written to disk), text, audio or video type, a hex dump, or an
   archive's listing. **Quick Look** shows pictures, media and PDFs from a
   temporary copy in zenteru's per-launch private folder, which zenteru
   deletes when it quits.
@@ -63,8 +64,10 @@ which makes it much faster than the reference with identical output.
 [`zenobfus/container.py`](zenobfus/container.py) and
 [`zenobfus/rs.py`](zenobfus/rs.py) port obfus-react's container and
 Reed–Solomon codec (`src/engine/container.ts`, `ecc.ts`, `rs.ts`, same field,
-generator and conventions). They are tested against files obfus-react wrote
-([tests/fixtures/obfus-react](../tests/fixtures/obfus-react)), and in CI
+generator and conventions). They are tested against files obfus-react's
+engine wrote ([tests/fixtures/obfus-react](../tests/fixtures/obfus-react)),
+files made on the deployed site, obfus.sjun.me
+([tests/fixtures/obfus-react-web](../tests/fixtures/obfus-react-web)), and in CI
 obfus-react's engine also reads what zenobfus writes and damages. Two
 differences from obfus-react, with the same output: a chunk whose CRC
 matches skips the RS decoder, and with ECC on the header is checked

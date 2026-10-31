@@ -68,6 +68,27 @@ if HAVE_ZENTERU:
             self.inputs.append(p)
             return {}
 
+        #: Set to make image blocks fail like an undecodable image does in zenteru.
+        reject_images = False
+
+        def _check_blocks(self, p: dict) -> None:
+            for b in p.get("blocks") or []:
+                if b.get("type") == "image" and self.reject_images:
+                    raise MockError("bad_request", "image: can't decode")
+
+        def m_panel_append(self, c: Any, p: dict) -> dict:
+            self._check_blocks(p)
+            r = super().m_panel_append(c, p)
+            self._panel(p["panel_id"])["messages"][r["message_id"]]["blocks"] = list(p.get("blocks") or [])
+            return r
+
+        def m_panel_update(self, c: Any, p: dict) -> dict:
+            self._check_blocks(p)
+            r = super().m_panel_update(c, p)
+            if "blocks" in p:
+                self._panel(p["panel_id"])["messages"][p["message_id"]]["blocks"] = list(p["blocks"] or [])
+            return r
+
         def m_session_get_variable(self, c: Any, p: dict) -> dict:
             if p.get("name") == "session.jobName" and p.get("session_id") in self.job_names:
                 return {"value": self.job_names[p["session_id"]]}

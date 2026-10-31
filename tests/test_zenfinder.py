@@ -21,6 +21,10 @@ exec sh -c "$last"
 """
 
 
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a730000001149444154789c63f8cfc000440c60f23f001bf203fdf3e74bb10000000049454e44ae426082")
+
+
 def read(path: str) -> str:
     with open(path) as f:
         return f.read()
@@ -248,6 +252,23 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         await self.until(lambda: "second line" in self.last()["text"])
         self.assertIn("text", self.last()["text"])
 
+    async def test_image_preview_shows_the_picture(self):
+        png = os.path.join(self.dir, "pic.png")
+        with open(png, "wb") as f:
+            f.write(PNG_BYTES)
+        await self.open()
+        await self.click("pic.png", "preview")
+        await self.until(lambda: self.last().get("blocks"))
+        self.assertIn("PNG image", self.last()["text"])
+        self.assertEqual(self.last()["blocks"], [{"type": "image", "alt": "pic.png", "max_height": 18, "path": png}])
+        # zenteru can't decode it: the preview falls back to text
+        self.server.reject_images = True
+        await self.click("notes.txt", "preview")
+        await self.until(lambda: "second line" in self.last()["text"])
+        await self.click("pic.png", "preview")
+        await self.until(lambda: "image not shown" in self.last()["text"])
+        self.assertEqual(self.last()["blocks"], [])
+
     async def test_open_folder_and_insert_path(self):
         await self.open()
         await self.click("▸ docs/", "open")
@@ -343,6 +364,17 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
                 self.assertIn("get", actions)
                 await self.click("server.log", "preview")
                 await self.until(lambda: "remote!" in self.last()["text"])
+                with open(os.path.join(remote, "big.png"), "wb") as f:
+                    f.write(PNG_BYTES + os.urandom(100_000))  # more than the 64 KiB first read
+                await self.type("cd " + remote)
+                await self.until(lambda: any("big.png" in t for t in self.texts()) and self.messages()
+                                 and self.last()["text"].startswith("server.log"))
+                await self.click("big.png", "preview")
+                await self.until(lambda: self.last().get("blocks"))
+                import base64
+
+                with open(os.path.join(remote, "big.png"), "rb") as f:
+                    self.assertEqual(base64.b64decode(self.last()["blocks"][0]["base64"]), f.read())
         shutil.rmtree(bindir)
         shutil.rmtree(remote)
 

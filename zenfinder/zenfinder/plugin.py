@@ -32,7 +32,9 @@ import zenteru
 from zenteru import Command, CommandInvocation, Connection, DropEvent, DropHandler, Panel, RPCError
 
 from .backends import Backend, BackendError, Exists, LocalBackend, RemoteBackend, valid_name, visible
-from .browserpanel import BrowserPanel, Entry, decode_text, hex_preview, human_size, text_preview
+from .browserpanel import (
+    IMAGE_INLINE_MAX, BrowserPanel, Entry, decode_text, hex_preview, human_size, image_block, image_kind, text_preview,
+)
 from .config import Config, normalize_ext, paste_name
 from .sshargs import CONFIG_SNIPPET, auth_command, control_dir, foreground_ssh, parse_ps, remote_cwd_from_prompt
 
@@ -449,6 +451,11 @@ class ZenFinder:
         if v.previewed is not e:
             return
         size = f"{human_size(e.size)}" if e.size is not None else ""
+        acts = [*extra, ("close", "Close")]
+        img = image_kind(data)
+        if img is not None:
+            await self.preview_image(v, e, path, img, size, data, acts)
+            return
         text = decode_text(data)
         if text is not None:
             body = text_preview(text, e.size)
@@ -456,8 +463,31 @@ class ZenFinder:
         else:
             body = hex_preview(data)
             kind = "binary"
-        await v.bp.set_preview(f"{e.name} — {kind}{', ' + size if size else ''}\n{'─' * 24}\n{body}",
-                               [*extra, ("close", "Close")])
+        await v.bp.set_preview(f"{e.name} — {kind}{', ' + size if size else ''}\n{'─' * 24}\n{body}", acts)
+
+    async def preview_image(self, v: View, e: Entry, path: str, kind: str, size: str, head: bytes,
+                            acts: list[tuple[str, str]]) -> None:
+        """Show the picture itself: by path on this Mac, inline from ssh hosts."""
+        b = v.backend
+        title = f"{e.name} — {kind}{', ' + size if size else ''}"
+        if isinstance(b, LocalBackend):
+            await v.bp.set_preview(title, acts, blocks=[image_block(path=path, alt=e.name)])
+            return
+        assert b is not None
+        if e.size is None or e.size > IMAGE_INLINE_MAX:
+            await v.bp.set_preview(f"{title}\ntoo large to show from {b.label}; Download it to look.", acts)
+            return
+        data = head
+        if len(head) < e.size:
+            await v.bp.set_preview(f"{title}\nfetching from {b.label}…", acts)
+            try:
+                data = await b.read_head(path, e.size)
+            except BackendError as err:
+                await v.bp.set_preview(f"{title}\n{err}", acts)
+                return
+            if v.previewed is not e:
+                return
+        await v.bp.set_preview(title, acts, blocks=[image_block(data=data, alt=e.name)])
 
     # ------------------------------------------------------------------
     # shell

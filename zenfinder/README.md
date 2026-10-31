@@ -21,8 +21,12 @@ or over ssh. Open it with `@zenfinder` or from the ⌘⇧P palette.
   the remote home.
 - The panel **follows the shell** as you `cd`, until you navigate in the
   panel yourself. **Follow shell** turns it back on.
-- The browser sits at the top and the **preview** at the bottom: text (or
-  a hex dump for binary files) for the file you pick.
+- The browser sits at the top and the **preview** at the bottom: the
+  **picture itself** for images (PNG, JPEG, GIF, WebP, HEIC, TIFF, BMP,
+  PDF…; zenteru 0.1.17+), text, or a hex dump for other binary files.
+  Images on this Mac are passed to zenteru by path; images on an ssh host
+  (up to 32 MiB) are fetched and sent inline. If zenteru can't decode one,
+  the preview says so and falls back to text.
 - **Insert path** types the quoted path into the session. **cd shell here**
   types `cd -- <dir>` without pressing Enter.
 - **Download** (ssh) saves to `~/Downloads`, never overwriting. **Reveal**

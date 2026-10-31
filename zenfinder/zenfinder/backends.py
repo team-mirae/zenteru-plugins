@@ -352,7 +352,9 @@ class RemoteBackend(Backend):
         return parse_listing(raw)
 
     async def read_head(self, path: str, n: int = PREVIEW_BYTES) -> bytes:
-        return await self.run(" ".join(["head", "-c", str(int(n)), "--", shlex.quote(path)]), timeout=30)
+        # Whole images can be tens of MiB: allow for a slow link.
+        return await self.run(" ".join(["head", "-c", str(int(n)), "--", shlex.quote(path)]),
+                              timeout=30 + n / (256 * 1024))
 
     async def exists(self, path: str) -> bool:
         try:

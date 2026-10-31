@@ -34,7 +34,7 @@ import zenteru
 from zenteru import Command, CommandInvocation, Connection, Panel, RPCError
 
 from . import container, obfus
-from .browserpanel import BrowserPanel, Entry, human_size
+from .browserpanel import IMAGE_INLINE_MAX, BrowserPanel, Entry, human_size, image_block, image_kind
 from .contents import Kind, Tree, describe, open_tree, sniff
 
 log = logging.getLogger("zenobfus")
@@ -384,6 +384,14 @@ class ZenObfus:
         else:
             title = f"{e.name}\nnot obfuscated"
         body = await asyncio.to_thread(describe, o.name, o.data, o.kind)
+        blocks: list[dict] = []
+        if image_kind(o.data[:32]) is not None:
+            if not o.unpacked and not v.stack:
+                blocks = [image_block(path=e.data, alt=o.name)]
+            elif len(o.data) <= IMAGE_INLINE_MAX:
+                blocks = [image_block(data=o.data, alt=o.name)]  # unpacked in memory, never written
+            if blocks:
+                body = body.replace("Quick Look shows the picture.", "").replace("Quick Look shows the pages.", "").rstrip()
         acts = [("ql", "Quick Look")]
         if o.kind.openable:
             acts.append(("open", "Open"))
@@ -394,7 +402,7 @@ class ZenObfus:
         else:
             acts.append(("pack", "Obfuscate…"))
         acts.append(("close", "Close"))
-        await v.bp.set_preview(f"{title}\n{'─' * 24}\n{body}", acts)
+        await v.bp.set_preview(f"{title}\n{'─' * 24}\n{body}", acts, blocks=blocks)
 
     async def open_entry(self, v: View, e: Entry) -> None:
         if e.is_dir:

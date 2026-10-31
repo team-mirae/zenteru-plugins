@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 __all__ = [
     "Entry", "BrowserPanel", "human_size", "display_name", "format_entry",
-    "decode_text", "text_preview", "hex_preview",
+    "decode_text", "text_preview", "hex_preview", "image_kind", "image_block",
 ]
 
 PAGE_SIZE = 60
@@ -146,6 +146,57 @@ def hex_preview(data: bytes, n: int = 256) -> str:
     return "\n".join(rows) if rows else "(empty)"
 
 
+# -- images (zenteru 0.1.17+ panel blocks) ----------------------------------
+
+#: Largest image sent inline (base64 over the API socket). zenteru itself
+#: decodes up to 64 MiB; files on this Mac are passed by path instead.
+IMAGE_INLINE_MAX = 32 * 1024 * 1024
+#: Preview images are at most this many cells tall, so the listing stays visible.
+IMAGE_MAX_HEIGHT = 18
+
+
+def image_kind(head: bytes) -> Optional[str]:
+    """A label if ``head`` starts like an image macOS can decode, else None."""
+    h = head[:32]
+    if h.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG image"
+    if h.startswith(b"\xff\xd8\xff"):
+        return "JPEG image"
+    if h[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF image"
+    if h[:4] == b"RIFF" and h[8:12] == b"WEBP":
+        return "WebP image"
+    if h[:4] in (b"II*\0", b"MM\0*"):
+        return "TIFF image"
+    if h[:2] == b"BM" and len(h) >= 18 and int.from_bytes(h[14:18], "little") in (12, 40, 52, 56, 108, 124):
+        return "BMP image"
+    if h[4:8] == b"ftyp" and h[8:12] in (b"heic", b"heix", b"mif1", b"msf1", b"hevc", b"heim", b"heis"):
+        return "HEIC image"
+    if h[4:8] == b"ftyp" and h[8:12] in (b"avif", b"avis"):
+        return "AVIF image"
+    if h[:4] == b"\0\0\1\0":
+        return "ICO image"
+    if h.startswith(b"%PDF-"):
+        return "PDF document"
+    return None
+
+
+def image_block(path: Optional[str] = None, data: Optional[bytes] = None, alt: str = "image",
+                max_height: int = IMAGE_MAX_HEIGHT) -> dict:
+    """A zenteru image block from a file on this Mac or from bytes."""
+    import base64
+    import os
+
+    b: dict[str, Any] = {"type": "image", "alt": alt, "max_height": int(max_height)}
+    if path is not None:
+        b["path"] = os.path.abspath(path)
+    elif data is not None:
+        b["base64"] = base64.b64encode(bytes(data)).decode("ascii")
+    else:
+        raise ValueError("image_block needs a path or data")
+    return b
+
+
 ActionsFor = Callable[[Entry], Sequence[tuple[str, str]]]
 
 
@@ -168,7 +219,7 @@ class BrowserPanel:
         self.page = 0
         self._header: tuple[str, list[tuple[str, str]]] = ("", [])
         self._actions_for: Optional[ActionsFor] = None
-        self._preview: tuple[str, list[tuple[str, str]]] = (PREVIEW_IDLE, [])
+        self._preview: tuple[str, list[tuple[str, str]], list[dict]] = (PREVIEW_IDLE, [], [])
         self._question: Optional[asyncio.Future] = None
         self._formatter: Optional[Callable[[Entry], str]] = None
         #: Serializes panel writes: a redraw clears the panel, so an update
@@ -200,7 +251,7 @@ class BrowserPanel:
         self._actions_for = actions_for
         self.page = min(max(page, 0), self.pages - 1)
         if not keep_preview and not self.asking:
-            self._preview = (PREVIEW_IDLE, [])
+            self._preview = (PREVIEW_IDLE, [], [])
         async with self._lock:
             await self._draw()
 
@@ -239,8 +290,7 @@ class BrowserPanel:
                 f"{start + 1}–{start + len(shown)} of {len(self.entries)}",
                 actions=pager_actions,
             )
-        text, pactions = self._preview
-        self.preview_id = await p.async_append("system", text, actions=pactions)
+        await self._send_preview(append=True)
 
     def _format(self, e: Entry, now: Optional[float] = None) -> str:
         return self._formatter(e) if self._formatter is not None else format_entry(e, now)
@@ -252,15 +302,39 @@ class BrowserPanel:
             if self.header_id is not None:
                 await self.panel.async_update(self.header_id, text=header, actions=acts)
 
-    async def set_preview(self, text: str, actions: Iterable[tuple[str, str]] = ()) -> None:
-        """Show ``text`` in the preview slot (the bottom message)."""
-        acts = list(actions)
-        self._preview = (text, acts)
+    async def set_preview(self, text: str, actions: Iterable[tuple[str, str]] = (),
+                          blocks: Sequence[dict] = ()) -> None:
+        """Show ``text`` in the preview slot (the bottom message).
+
+        ``blocks`` (zenteru 0.1.17+) adds rich content after the text, e.g.
+        an :func:`image_block`. If zenteru can't show them (it can't decode
+        the image, or it is older), the preview falls back to the text.
+        """
+        self._preview = (text, list(actions), list(blocks))
         async with self._lock:
-            if self.preview_id is None:
-                self.preview_id = await self.panel.async_append("system", text, actions=acts)
-            else:
-                await self.panel.async_update(self.preview_id, text=text, actions=acts)
+            await self._send_preview(append=self.preview_id is None)
+
+    async def _send_preview(self, append: bool) -> None:
+        text, acts, blocks = self._preview
+        params: dict[str, Any] = {"panel_id": self.panel.panel_id, "text": text,
+                                  "actions": [{"id": a, "label": l} for a, l in acts], "blocks": blocks}
+        if append:
+            params["role"] = "system"
+        else:
+            params["message_id"] = self.preview_id
+        method = "panel.append" if append else "panel.update"
+        try:
+            r = await self.panel.connection.async_call(method, params)
+        except Exception as e:  # zenteru refused a block (e.g. an image it can't decode)
+            if not blocks or getattr(e, "code", None) not in ("bad_request", "unsupported"):
+                raise
+            note = getattr(e, "message", None) or str(e)
+            params["blocks"] = [b for b in blocks if b.get("type") != "image"]
+            params["text"] = f"{text}\n(image not shown: {note})"
+            self._preview = (params["text"], acts, params["blocks"])
+            r = await self.panel.connection.async_call(method, params)
+        if append:
+            self.preview_id = (r or {}).get("message_id")
 
     async def clear_preview(self) -> None:
         await self.set_preview(PREVIEW_IDLE)

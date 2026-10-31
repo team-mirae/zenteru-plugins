@@ -1,7 +1,7 @@
 {
   "name": "zenobfus",
   "title": "zenobfus — obfus browser",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Side-panel browser that unpacks .obfus files in memory and previews them, archives included; reads obfus-react ECC containers and repairs them.",
   "entry": "main.py",
   "autostart": true

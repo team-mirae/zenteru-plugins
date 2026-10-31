@@ -157,6 +157,55 @@ class ContainerTest(unittest.TestCase):
             container.unpack(b"neither a blob nor a container")
 
 
+def gradient_png() -> bytes:
+    """The 240×240 PNG the obfus-react site packed (built the same way)."""
+    import struct
+    import zlib
+
+    W = H = 240
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)
+        for x in range(W):
+            raw += bytes([(x * 255 // W) & 255, (y * 255 // H) & 255, (x ^ y) & 255])
+    z = bytearray(b"\x78\x01")
+    for i in range(0, len(raw), 65535):
+        blk = raw[i:i + 65535]
+        z += bytes([1 if i + 65535 >= len(raw) else 0]) + struct.pack("<HH", len(blk), (~len(blk)) & 0xFFFF) + blk
+    z += struct.pack(">I", zlib.adler32(bytes(raw)))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", bytes(z)) + chunk(b"IEND", b""))
+
+
+class ObfusReactSiteTest(unittest.TestCase):
+    """Files the deployed site (obfus.sjun.me) produced are recognised as obfus."""
+
+    def site(self, name):
+        with open(os.path.join(_zt.ROOT, "tests", "fixtures", "obfus-react-web", name), "rb") as f:
+            return f.read()
+
+    def test_ecc_container_from_the_site(self):
+        import hashlib
+
+        blob = self.site("gradient.png.obfus")
+        self.assertEqual(hashlib.sha256(blob).hexdigest()[:8], "07398821")
+        self.assertEqual(container.describe_probe(blob[:container.PROBE_LEN]), "obfus ecc")
+        self.assertEqual(contents.sniff("gradient.png.obfus", blob).family, "obfus")
+        u = container.unpack(blob)
+        self.assertEqual((u.container, u.ecc, u.chunk_count, u.chunk_size, u.damaged), (True, True, 1, 8 << 20, []))
+        self.assertEqual(u.data, gradient_png())
+        self.assertEqual(contents.sniff("gradient.png", u.data).label, "PNG image")
+
+    def test_plain_blob_from_the_site(self):
+        blob = self.site("small.txt.obfus")
+        self.assertEqual(container.describe_probe(blob[:container.PROBE_LEN]), "obfus")
+        self.assertEqual(container.unpack(blob).data, b"small file, too small for ECC within 5%\n" * 25)
+
+
 @unittest.skipUnless(os.environ.get("OBFUS_REACT_SRC") and shutil.which("node"), "set OBFUS_REACT_SRC to an obfus-react checkout")
 class ObfusReactInteropTest(unittest.TestCase):
     """obfus-react's engine reads what zenobfus writes, and agrees on damage."""
@@ -192,6 +241,11 @@ class ObfusReactInteropTest(unittest.TestCase):
         with open(os.path.join(d, "out"), "rb") as f:
             self.assertEqual(f.read(), mine.data)
         shutil.rmtree(d)
+
+def contents_png() -> bytes:
+    return bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a730000001149444154789c63f8cfc000440c60f23f001bf203fdf3e74bb10000000049454e44ae426082")
+
 
 FIXTURE_PNG = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x03\x00\x00\x00\x02\x08\x02\x00\x00\x00"
@@ -348,6 +402,33 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         self.assertIn("[not obfus]", row("fake.obfus"))
         self.assertNotIn("[", row("plain.txt"))
         self.assertFalse(any("encrypted" in t.replace("not encryption", "") for t in texts))
+
+    async def test_obfuscated_image_preview_shows_the_picture(self):
+        import base64
+
+        png = contents_png()
+        with open(os.path.join(self.dir, "pic.png.obfus"), "wb") as f:
+            f.write(container.pack(png, 1 << 20, True))
+        await self.server.panel_action(self.panel_id(), self.messages()[0][0], "refresh")
+        await self.until(lambda: any("pic.png.obfus" in t for t in self.texts()) and "Select a file" in self.last()["text"])
+        await self.click("pic.png.obfus", "preview")
+        await self.until(lambda: self.last().get("blocks"))
+        self.assertIn("PNG image, 2×2", self.last()["text"])
+        self.assertNotIn("Quick Look shows", self.last()["text"])
+        self.assertEqual(base64.b64decode(self.last()["blocks"][0]["base64"]), png)
+        self.assertNotIn("pic.png", os.listdir(self.dir))  # shown from memory, not written
+
+    async def test_site_made_image_previews_as_a_picture(self):
+        import base64
+
+        shutil.copy(os.path.join(_zt.ROOT, "tests", "fixtures", "obfus-react-web", "gradient.png.obfus"), self.dir)
+        await self.server.panel_action(self.panel_id(), self.messages()[0][0], "refresh")
+        await self.until(lambda: any("gradient.png.obfus" in t and "[obfus ecc]" in t for t in self.texts()))
+        await self.click("gradient.png.obfus", "preview")
+        await self.until(lambda: self.last().get("blocks"))
+        self.assertIn("PNG image, 240×240", self.last()["text"])
+        self.assertIn("all chunks verified", self.last()["text"])
+        self.assertEqual(base64.b64decode(self.last()["blocks"][0]["base64"]), gradient_png())
 
     async def test_preview_unpacks_in_memory(self):
         await self.click("note.txt.obfus", "preview")
