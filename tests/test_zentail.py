@@ -189,7 +189,7 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         self.assertIn("exit node: none", texts[0])
         self.assertTrue(any(t.startswith("● web  100.64.0.5  linux  direct") and "[exit node]" in t for t in texts))
         self.assertTrue(any(t.startswith("○ neo") and "offline" in t for t in texts))
-        self.assertIn("2/3 peers online", self.status())
+        await self.until(lambda: "2/3 peers online" in self.status())
 
     async def test_ping_copy_ssh(self):
         await self.open()
@@ -210,7 +210,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         await self.type("ec2-user")
         await self.until(lambda: any(m == "tab.create" for m, _ in self.server.calls))
         self.assertTrue(self.server.last_call("tab.create")["command"].startswith("ssh -l ec2-user web.tail.example;"))
-        self.assertEqual(json.load(open(os.path.join(self.tmp, "data", "ssh-users.json"))), {"web": "ec2-user"})
+        with open(os.path.join(self.tmp, "data", "ssh-users.json")) as f:
+            self.assertEqual(json.load(f), {"web": "ec2-user"})
         n = len(self.server.calls)
         await self.click("● web", "ssh")
         await self.until(lambda: any(m == "tab.create" for m, _ in self.server.calls[n:]))
@@ -235,9 +236,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
     async def test_accounts_and_typed_commands(self):
         await self.open()
         await self.server.panel_action(self.panel_id(), self.messages()[0][0], "accounts")
-        await self.until(lambda: "me@corp.com" in self.last()["text"])
-        ids = [a["id"] for a in self.last()["actions"]]
-        self.assertIn("switch:b2", ids)
+        await self.until(lambda: "me@corp.com" in self.last()["text"]
+                         and "switch:b2" in [a["id"] for a in self.last().get("actions") or []])
         await self.type("netcheck")
         await self.until(lambda: "UDP: true" in self.last()["text"])
         await self.type("login")

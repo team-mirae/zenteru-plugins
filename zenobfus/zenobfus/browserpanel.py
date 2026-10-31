@@ -171,6 +171,9 @@ class BrowserPanel:
         self._preview: tuple[str, list[tuple[str, str]]] = (PREVIEW_IDLE, [])
         self._question: Optional[asyncio.Future] = None
         self._formatter: Optional[Callable[[Entry], str]] = None
+        #: Serializes panel writes: a redraw clears the panel, so an update
+        #: that interleaved with it would target a message that is gone.
+        self._lock = asyncio.Lock()
 
     # -- layout ---------------------------------------------------------
 
@@ -198,13 +201,15 @@ class BrowserPanel:
         self.page = min(max(page, 0), self.pages - 1)
         if not keep_preview and not self.asking:
             self._preview = (PREVIEW_IDLE, [])
-        await self._draw()
+        async with self._lock:
+            await self._draw()
 
     async def set_page(self, page: int) -> None:
         if self._actions_for is None:
             return
         self.page = min(max(page, 0), self.pages - 1)
-        await self._draw()
+        async with self._lock:
+            await self._draw()
 
     async def _draw(self) -> None:
         p = self.panel
@@ -243,28 +248,31 @@ class BrowserPanel:
     async def set_header(self, header: str, actions: Optional[Iterable[tuple[str, str]]] = None) -> None:
         acts = list(actions) if actions is not None else self._header[1]
         self._header = (header, acts)
-        if self.header_id is not None:
-            await self.panel.async_update(self.header_id, text=header, actions=acts)
+        async with self._lock:
+            if self.header_id is not None:
+                await self.panel.async_update(self.header_id, text=header, actions=acts)
 
     async def set_preview(self, text: str, actions: Iterable[tuple[str, str]] = ()) -> None:
         """Show ``text`` in the preview slot (the bottom message)."""
         acts = list(actions)
         self._preview = (text, acts)
-        if self.preview_id is None:
-            self.preview_id = await self.panel.async_append("system", text, actions=acts)
-        else:
-            await self.panel.async_update(self.preview_id, text=text, actions=acts)
+        async with self._lock:
+            if self.preview_id is None:
+                self.preview_id = await self.panel.async_append("system", text, actions=acts)
+            else:
+                await self.panel.async_update(self.preview_id, text=text, actions=acts)
 
     async def clear_preview(self) -> None:
         await self.set_preview(PREVIEW_IDLE)
 
     async def update_row(self, entry: Entry) -> None:
         """Redraw one entry's row (after its badge or size changed)."""
-        for mid, e in self.rows.items():
-            if e is entry:
-                assert self._actions_for is not None
-                await self.panel.async_update(mid, text=self._format(e), actions=list(self._actions_for(e)))
-                return
+        async with self._lock:
+            for mid, e in self.rows.items():
+                if e is entry:
+                    assert self._actions_for is not None
+                    await self.panel.async_update(mid, text=self._format(e), actions=list(self._actions_for(e)))
+                    return
 
     # -- questions ------------------------------------------------------
 

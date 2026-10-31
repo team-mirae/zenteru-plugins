@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -28,6 +29,11 @@ def load_zenman():
 
 
 zm = load_zenman()
+
+
+def version(plugin):
+    with open(os.path.join(ROOT, plugin, "plugin.json")) as f:
+        return json.load(f)["version"]
 
 
 def build(out):
@@ -71,8 +77,9 @@ class ZenmanTest(unittest.TestCase):
         receipt = json.load(open(os.path.join(d, ".zenman.json")))
         self.assertEqual(receipt["commit"], "abc123")
         code, out = self.run_zm("list")
-        self.assertRegex(out, r"zenfinder\s+0\.1\.0\s+0\.1\.0")
-        self.assertRegex(out, r"zentail\s+0\.1\.0\s+-")
+        zf, zt = version("zenfinder"), version("zentail")
+        self.assertRegex(out, rf"zenfinder\s+{re.escape(zf)}\s+{re.escape(zf)}")
+        self.assertRegex(out, rf"zentail\s+{re.escape(zt)}\s+-")
         code, out = self.run_zm("update")
         self.assertIn("up to date", out)
         # simulate an older install

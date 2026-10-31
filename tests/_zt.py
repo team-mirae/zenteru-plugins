@@ -118,7 +118,9 @@ if HAVE_ZENTERU:
             raise AssertionError(f"no row with {needle!r} in {self.texts()}")
 
         def last(self) -> dict:
-            return self.messages()[-1][1]
+            """The bottom message ({} while the panel is being redrawn)."""
+            m = self.messages()
+            return m[-1][1] if m else {"text": "", "actions": []}
 
         def status(self) -> str:
             return self.server.panels[self.panel_id()]["status"]
