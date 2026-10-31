@@ -143,7 +143,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         self.plugin = ZenObfus(self.conn)
         await self.plugin.async_register()
         await self.invoke("zenobfus.toggle")
-        await self.until(lambda: self.server.panels and any("note.txt.obfus" in t for t in self.texts()))
+        await self.until(lambda: self.server.panels and any("note.txt.obfus" in t for t in self.texts())
+                         and "Select a file" in self.last()["text"])
 
     async def asyncTearDown(self):
         self.envp.stop()

@@ -179,7 +179,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
 
     async def open(self):
         await self.invoke("zentail.toggle")
-        await self.until(lambda: self.server.panels and any("web" in t for t in self.texts()))
+        await self.until(lambda: self.server.panels and any("○ neo" in t for t in self.texts())
+                         and "peers online" in self.status())
 
     async def test_status_and_peers(self):
         await self.open()

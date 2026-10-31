@@ -234,7 +234,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
 
     async def open(self):
         await self.invoke("zenfinder.toggle")
-        await self.until(lambda: self.server.panels and any("notes.txt" in t for t in self.texts()))
+        await self.until(lambda: self.server.panels and any("notes.txt" in t for t in self.texts())
+                         and "Select a file" in self.last()["text"])
 
     async def test_lists_cwd_with_preview_at_the_bottom(self):
         await self.open()
