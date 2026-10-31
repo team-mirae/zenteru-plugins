@@ -33,7 +33,7 @@ from typing import Any, Optional
 import zenteru
 from zenteru import Command, CommandInvocation, Connection, Panel, RPCError
 
-from . import obfus
+from . import container, obfus
 from .browserpanel import BrowserPanel, Entry, human_size
 from .contents import Kind, Tree, describe, open_tree, sniff
 
@@ -45,12 +45,16 @@ POLL_SECONDS = 1.5
 MAX_BYTES = 512 * 1024 * 1024
 #: Header checks per listing (one 6-byte read each).
 MAX_SNIFF = 2000
+#: Chunk size for containers zenobfus writes (obfus-react picks 64 KiB–8 MiB).
+CHUNK_SIZE = 1 << 20
 ARCHIVE_EXT = (".zip", ".tar", ".tgz", ".tar.gz", ".tbz2", ".tar.bz2", ".txz", ".tar.xz", ".jar")
 NOTICE = "obfus is obfuscation, not encryption: anyone can unpack these files."
 
 HELP = """\
 Select a file to preview it below. [obfus] files are unpacked in memory;
 nothing is saved unless you press Unpack… or Obfuscate….
+[obfus ecc] / [obfus chunked] are obfus-react containers: each chunk is
+CRC-checked, and ECC files are repaired from their Reed–Solomon parity.
 Type in the box:
   <name>       open a folder or archive / preview a file
   cd <path>    go to a folder on this Mac
@@ -84,6 +88,26 @@ def save_config(c: dict) -> None:
     os.replace(tmp, os.path.join(d, "config.json"))
 
 
+def is_obfus_badge(badge: str) -> bool:
+    return badge.startswith("obfus")
+
+
+def integrity_line(info: "container.Unpacked") -> str:
+    """One line about the container and what its ECC did."""
+    if not info.container:
+        return "plain blob (no checksum: damage can't be detected)"
+    kind = "ECC container, RS(255,243)" if info.ecc else "chunked container (CRC, no ECC)"
+    parts = [f"{kind}, {info.chunk_count} chunk(s)"]
+    if info.repaired:
+        parts.append(f"repaired {info.repaired} byte(s)" + (" incl. the header" if info.header_repaired else ""))
+    if info.damaged:
+        shown = ", ".join(str(i) for i in info.damaged[:8]) + (" …" if len(info.damaged) > 8 else "")
+        parts.append(f"⚠ {len(info.damaged)} chunk(s) damaged beyond repair, zero-filled: {shown}")
+    elif info.container:
+        parts.append("all chunks verified")
+    return " · ".join(parts)
+
+
 def display_path(p: str) -> str:
     h = os.path.expanduser("~")
     return "~" + p[len(h):] if p == h or p.startswith(h + "/") else p
@@ -114,10 +138,12 @@ class Opened:
     name: str
     data: bytes
     kind: Kind
-    #: True if ``data`` came from unpacking an obfus blob.
+    #: True if ``data`` came from unpacking an obfus blob or container.
     unpacked: bool
     #: Bytes as stored (before unpacking).
     raw_len: int
+    #: How it was unpacked (container, ECC repairs, damaged chunks).
+    info: Optional[container.Unpacked] = None
 
 
 @dataclass
@@ -240,11 +266,12 @@ class ZenObfus:
         for e in [e for e in out if not e.is_dir][:MAX_SNIFF]:
             try:
                 with open(e.data, "rb") as f:
-                    head = f.read(len(obfus.MAGIC))
+                    head = f.read(container.PROBE_LEN)
             except OSError:
                 continue
-            if obfus.is_obfus(head):
-                e.badge = "obfus"
+            tag = container.describe_probe(head)
+            if tag:
+                e.badge = tag
             elif e.name.endswith(obfus.EXT):
                 e.badge = "not obfus"
         return out
@@ -264,7 +291,7 @@ class ZenObfus:
         async with v.lock:
             await v.bp.render(self.header(v), self.toolbar(v), entries, lambda e: self.actions_for(v, e),
                               keep_preview=keep_preview, page=page)
-            n_obfus = sum(1 for e in entries if e.badge == "obfus")
+            n_obfus = sum(1 for e in entries if is_obfus_badge(e.badge))
             await v.panel.async_set_status(f"{len(entries)} item(s), {n_obfus} obfus")
 
     async def refresh(self, v: View) -> None:
@@ -300,11 +327,11 @@ class ZenObfus:
         if e.is_dir:
             return [("open", "Open")]
         acts = [("preview", "Preview")]
-        if e.badge == "obfus" or self._archive_name(e.name):
+        if is_obfus_badge(e.badge) or self._archive_name(e.name):
             acts.append(("open", "Open"))
         if v.stack:
             acts.append(("save", "Extract…"))
-        elif e.badge == "obfus":
+        elif is_obfus_badge(e.badge):
             acts.append(("save", "Unpack…"))
         else:
             acts.append(("pack", "Obfuscate…"))
@@ -334,16 +361,16 @@ class ZenObfus:
         raw = await self.read_entry(v, e)
 
         def work() -> Opened:
-            if obfus.is_obfus(raw):
-                plain = obfus.unpack(raw)
+            if container.detect(raw[:container.PROBE_LEN]):
+                info = container.unpack(raw, MAX_BYTES)
                 name = obfus.inner_name(e.name)
-                return Opened(e, name, plain, sniff(name, plain), True, len(raw))
+                return Opened(e, name, info.data, sniff(name, info.data), True, len(raw), info)
             return Opened(e, e.name, raw, sniff(e.name, raw), False, len(raw))
 
         return await asyncio.to_thread(work)
 
     async def preview(self, v: View, e: Entry) -> None:
-        await v.bp.set_preview(f"{e.name}\nunpacking…" if e.badge == "obfus" else f"{e.name}\nreading…", [("close", "Close")])
+        await v.bp.set_preview(f"{e.name}\nunpacking…" if is_obfus_badge(e.badge) else f"{e.name}\nreading…", [("close", "Close")])
         try:
             o = await self.open_contents(v, e)
         except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError, KeyError) as err:
@@ -352,6 +379,8 @@ class ZenObfus:
         v.opened = o
         if o.unpacked:
             title = f"{e.name}  →  {o.name}\nunpacked in memory: {human_size(o.raw_len)} → {human_size(len(o.data))}"
+            if o.info is not None:
+                title += "\n" + integrity_line(o.info)
         else:
             title = f"{e.name}\nnot obfuscated"
         body = await asyncio.to_thread(describe, o.name, o.data, o.kind)
@@ -360,6 +389,8 @@ class ZenObfus:
             acts.append(("open", "Open"))
         if o.unpacked or v.stack:
             acts.append(("save", "Unpack…" if not v.stack else "Extract…"))
+            if o.info is not None and o.info.repaired and not o.info.damaged and not v.stack:
+                acts.append(("repair", "Save repaired copy…"))
         else:
             acts.append(("pack", "Obfuscate…"))
         acts.append(("close", "Close"))
@@ -385,7 +416,7 @@ class ZenObfus:
         data, name, kind = o.data, o.name, o.kind
         # Peel further obfus layers (a.zip.obfus.obfus).
         while kind.family == "obfus":
-            data = await asyncio.to_thread(obfus.unpack, data)
+            data = (await asyncio.to_thread(container.unpack, data, MAX_BYTES)).data
             name = obfus.inner_name(name)
             kind = sniff(name, data)
         if not kind.is_archive:
@@ -487,8 +518,12 @@ class ZenObfus:
                 await v.panel.async_set_status(f"{e.name}: {err}")
                 return
         verb = "Extract" if v.stack else "Unpack"
+        warn = ""
+        if o.info is not None and o.info.damaged:
+            warn = (f"⚠ {len(o.info.damaged)} chunk(s) couldn't be repaired and are zero-filled in what\n"
+                    "would be saved.\n")
         name = await self.ask_name(
-            v, f"{verb} {e.name} ({human_size(len(o.data))}) to {display_path(v.fs_dir or '')} as:\n"
+            v, f"{warn}{verb} {e.name} ({human_size(len(o.data))}) to {display_path(v.fs_dir or '')} as:\n"
                "Enter saves, empty or Cancel saves nothing.", o.name)
         if name is None:
             return
@@ -504,18 +539,51 @@ class ZenObfus:
         except (OSError, ValueError) as err:
             await v.panel.async_set_status(f"{e.name}: {err}")
             return
-        if obfus.is_obfus(data):
+        if container.detect(data[:container.PROBE_LEN]):
             ans = await v.bp.ask(f"{e.name} is already an obfus blob. Obfuscating it again means it needs two\n"
                                  "unpacks to read. Do it anyway?", [("again", "Obfuscate again"), ("cancel", "Cancel")])
             if ans != ("action", "again"):
                 await v.bp.set_preview("Cancelled — nothing was saved.", [("close", "Close")])
                 return
+        ecc_size = container.packed_size(len(data), CHUNK_SIZE, True)
+        fmt = await v.bp.ask(
+            f"Obfuscate {e.name} ({human_size(len(data))}) as:\n"
+            f"  Plain blob: {human_size(len(data) + obfus.MAGIC_LEN)}, readable by obfus.py and obfus-react.\n"
+            f"  With ECC: {human_size(ecc_size)} (+{(ecc_size - len(data)) / max(1, len(data)):.1%}), obfus-react's container:\n"
+            "    a CRC per chunk, and Reed–Solomon parity that repairs up to 6 bad bytes in\n"
+            "    every 255. obfus.py can't read it; obfus-react and zenobfus can.",
+            [("bare", "Plain blob"), ("ecc", "With ECC"), ("cancel", "Cancel")])
+        if fmt not in (("action", "bare"), ("action", "ecc")):
+            await v.bp.set_preview("Cancelled — nothing was saved.", [("close", "Close")])
+            return
+        use_ecc = fmt == ("action", "ecc")
         name = await self.ask_name(
             v, f"Save an obfuscated copy of {e.name} to {display_path(v.fs_dir or '')} as:\n"
                f"The original is kept. {NOTICE}\nEnter saves, empty or Cancel saves nothing.", e.name + obfus.EXT)
         if name is None:
             return
-        packed = await asyncio.to_thread(obfus.pack, data)
+        if use_ecc:
+            packed = await asyncio.to_thread(container.pack, data, CHUNK_SIZE, True)
+        else:
+            packed = await asyncio.to_thread(obfus.pack, data)
+        dest = await self.write_new(v, name, packed, e.data)
+        if dest:
+            await self.after_write(v, f"Saved {display_path(dest)}.")
+
+    async def save_repaired(self, v: View, e: Entry) -> None:
+        """Write a fresh container from contents ECC had to repair."""
+        o = v.opened if v.opened is not None and v.opened.entry is e else None
+        if o is None or o.info is None or v.stack or o.info.damaged:
+            return
+        stem = e.name[: -len(obfus.EXT)] if e.name.endswith(obfus.EXT) else e.name
+        name = await self.ask_name(
+            v, f"ECC repaired {o.info.repaired} byte(s) in {e.name}. Save a repaired copy, with fresh\n"
+               "parity, as (the damaged file is kept):\nEnter saves, empty or Cancel saves nothing.",
+            f"{stem}.repaired{obfus.EXT}")
+        if name is None:
+            return
+        size = o.info.chunk_size or CHUNK_SIZE
+        packed = await asyncio.to_thread(container.pack, o.data, size, True)
         dest = await self.write_new(v, name, packed, e.data)
         if dest:
             await self.after_write(v, f"Saved {display_path(dest)}.")
@@ -618,6 +686,8 @@ class ZenObfus:
             await self.save_unpacked(v, e)
         elif a == "pack":
             await self.save_packed(v, e)
+        elif a == "repair":
+            await self.save_repaired(v, e)
         elif a == "ql":
             await self.quick_look(v, e)
 

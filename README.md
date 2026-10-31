@@ -8,7 +8,7 @@ Plugins for [zenteru](https://github.com/team-mirae/zenteru), plus
 | [**zenman**](zenman/) | Plugin manager CLI. It installs, updates, removes and links plugins from the live channel. |
 | [**zentail**](zentail/) | Tailscale in a side panel: status, peers, SSH, ping, exit nodes, accounts. It uses the Tailscale app's own CLI. |
 | [**zenfinder**](zenfinder/) | File browser in a side panel for the session's directory, on this Mac or over ssh. Drop files to upload them, or paste clipboard text as a file. |
-| [**zenobfus**](zenobfus/) | Browser for [`.obfus`](https://github.com/themrsung/file-obfuscation) files, laid out like zenfinder. Files are unpacked in memory and previewed, archives included. |
+| [**zenobfus**](zenobfus/) | Browser for [`.obfus`](https://github.com/themrsung/file-obfuscation) files, laid out like zenfinder. Files are unpacked in memory and previewed, archives included. Reads [obfus-react](https://github.com/themrsung/obfus-react)'s ECC containers and repairs damage from their Reed–Solomon parity. |
 
 ## Install
 

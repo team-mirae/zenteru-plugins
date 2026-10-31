@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from typing import Optional
 
-from . import obfus
+from . import container, obfus
 from .browserpanel import Entry, decode_text, hex_preview, human_size, text_preview
 
 IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "svg", "ico"}
@@ -40,8 +40,11 @@ def _ext(name: str) -> str:
 def sniff(name: str, data: bytes) -> Kind:
     """Classify ``data`` (named ``name``) by magic bytes, then extension."""
     h = data[:16]
-    if obfus.is_obfus(data):
+    tag = container.detect(data[:container.PROBE_LEN])
+    if tag == "bare":
         return Kind("obfus", "obfus blob")
+    if tag == "container":
+        return Kind("obfus", "obfus container")
     if h.startswith(b"\x89PNG\r\n\x1a\n"):
         return Kind("image", "PNG image")
     if h.startswith(b"\xff\xd8\xff"):

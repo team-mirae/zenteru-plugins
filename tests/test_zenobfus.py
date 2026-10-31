@@ -8,7 +8,190 @@ import zipfile
 from unittest import mock
 
 import _zt  # noqa: F401
-from zenobfus import contents, obfus
+from zenobfus import container, contents, obfus, rs
+
+FIXTURES = os.path.join(_zt.ROOT, "tests", "fixtures", "obfus-react")
+
+
+def fixture(name: str) -> bytes:
+    with open(os.path.join(FIXTURES, name), "rb") as f:
+        return f.read()
+
+
+def record_spans(blob: bytes, plain_len: int, chunk: int):
+    """(start, length) of each chunk record (header+blob) in an ECC container."""
+    off = container.HEADER_LEN + container.HEADER_PARITY_LEN
+    for i in range(max(1, -(-plain_len // chunk))):
+        n = container.RECORD_HEADER_LEN + min(chunk, plain_len - i * chunk) + obfus.MAGIC_LEN
+        yield off, n
+        off += n + rs.parity_len(n)
+
+
+class ReedSolomonTest(unittest.TestCase):
+    def test_corrects_up_to_half_the_parity(self):
+        import random
+
+        r = random.Random(11)
+        for trial in range(60):
+            data = bytes(r.randrange(256) for _ in range(r.randrange(1, 244)))
+            block = bytearray(data + rs.encode(data, 12))
+            n = r.randrange(0, 7)
+            for p in r.sample(range(len(block)), n):
+                block[p] ^= r.randrange(1, 256)
+            self.assertEqual(rs.decode_block(block, 12), n)
+            self.assertEqual(bytes(block[:len(data)]), data)
+
+    def test_detects_too_many_errors(self):
+        import random
+
+        r = random.Random(5)
+        caught = 0
+        for _ in range(40):
+            data = bytes(r.randrange(256) for _ in range(243))
+            block = bytearray(data + rs.encode(data, 12))
+            for p in r.sample(range(255), 9):
+                block[p] ^= r.randrange(1, 256)
+            try:
+                rs.decode_block(block, 12)
+                caught += bytes(block[:243]) != data  # miscorrection: the CRC catches it
+            except rs.RsUncorrectable:
+                caught += 1
+        self.assertEqual(caught, 40)
+
+    def test_encode_matches_reference_construction(self):
+        # parity = remainder of data(x)·x^nsym divided by the generator
+        data = b"obfus-react"
+        g = rs.generator(12)
+        msg = list(data) + [0] * 12
+        for i in range(len(data)):
+            c = msg[i]
+            if c:
+                for j in range(1, len(g)):
+                    msg[i + j] ^= rs.mul(g[j], c)
+        self.assertEqual(rs.encode(data, 12), bytes(msg[len(data):]))
+
+
+class ContainerTest(unittest.TestCase):
+    """obfus-react's chunked container, against files obfus-react wrote."""
+
+    def setUp(self):
+        self.plain = fixture("plain.txt")
+
+    def test_reads_obfus_react_files(self):
+        for name, chunks, ecc, is_container in (("ecc-chunked", 9, True, True), ("chunked", 9, False, True),
+                                                ("ecc-single", 1, True, True), ("bare", 1, False, False)):
+            blob = fixture(f"{name}.txt.obfus")
+            u = container.unpack(blob)
+            self.assertEqual(u.data, self.plain, name)
+            self.assertEqual((u.container, u.ecc, u.chunk_count, u.repaired, u.damaged),
+                             (is_container, ecc, chunks, 0, []), name)
+            self.assertEqual(container.packed_size(len(self.plain), 1024 if "chunked" in name else 1 << 20, ecc), len(blob))
+
+    def test_badges(self):
+        tag = lambda n: container.describe_probe(fixture(n)[:container.PROBE_LEN])  # noqa: E731
+        self.assertEqual(tag("ecc-chunked.txt.obfus"), "obfus ecc")
+        self.assertEqual(tag("chunked.txt.obfus"), "obfus chunked")
+        self.assertEqual(tag("bare.txt.obfus"), "obfus")
+        self.assertIsNone(tag("plain.txt"))
+
+    def test_repairs_damage_at_the_full_radius_and_a_destroyed_magic(self):
+        import random
+
+        r = random.Random(3)
+        d = bytearray(fixture("ecc-chunked.txt.obfus"))
+        for i in range(6):
+            d[i] ^= 0xFF  # "OBFSCT" gone: the most the header's 12 parity bytes can fix
+        hits = 6
+        for start, n in record_spans(d, len(self.plain), 1024):
+            for b in range(0, n, 243):
+                e = min(b + 243, n)
+                for p in r.sample(range(b, e), min(6, e - b)):
+                    d[start + p] ^= r.randrange(1, 256)
+                    hits += 1
+        self.assertEqual(container.detect(bytes(d[:container.PROBE_LEN])), "container")
+        u = container.unpack(bytes(d))
+        self.assertEqual(u.data, self.plain)
+        self.assertEqual((u.repaired, u.header_repaired, u.damaged), (hits, True, []))
+
+    def test_damaged_header_fields_are_repaired_too(self):
+        d = bytearray(fixture("ecc-chunked.txt.obfus"))
+        d[14] ^= 0x40  # chunk size
+        u = container.unpack(bytes(d))
+        self.assertEqual(u.data, self.plain)
+        self.assertTrue(u.header_repaired)
+
+    def test_unrepairable_chunk_is_zero_filled_and_reported(self):
+        d = bytearray(fixture("ecc-chunked.txt.obfus"))
+        start, _ = list(record_spans(d, len(self.plain), 1024))[2]
+        for p in range(start + 20, start + 40):
+            d[p] ^= 0x55
+        u = container.unpack(bytes(d))
+        self.assertEqual(u.damaged, [2])
+        self.assertEqual(len(u.data), len(self.plain))
+        self.assertEqual(u.data[2048:3072], bytes(1024))
+        self.assertEqual(u.data[:2048] + u.data[3072:], self.plain[:2048] + self.plain[3072:])
+
+    def test_crc_catches_damage_without_ecc(self):
+        d = bytearray(fixture("chunked.txt.obfus"))
+        d[container.HEADER_LEN + 100] ^= 1
+        self.assertEqual(container.unpack(bytes(d)).damaged, [0])
+
+    def test_round_trip_and_bare_when_small_without_ecc(self):
+        for size in (0, 1, 243, 1000, 5000):
+            data = os.urandom(size)
+            for chunk, ecc in ((700, True), (700, False), (1 << 20, True)):
+                blob = container.pack(data, chunk, ecc)
+                self.assertEqual(len(blob), container.packed_size(size, chunk, ecc))
+                self.assertEqual(container.unpack(blob).data, data)
+        self.assertFalse(container.is_container(container.pack(b"x", 1 << 20, False)))
+        self.assertEqual(obfus.unpack(container.pack(b"x", 1 << 20, False)), b"x")
+
+    def test_rejects_inconsistent_headers(self):
+        blob = bytearray(container.pack(b"x" * 3000, 1024, False))
+        blob[18] = 99  # chunk count
+        with self.assertRaises(container.ContainerError):
+            container.unpack(bytes(blob))
+        with self.assertRaises(container.ContainerError):
+            container.unpack(container.pack(b"x" * 3000, 1024, True), max_bytes=100)
+        with self.assertRaises(ValueError):
+            container.unpack(b"neither a blob nor a container")
+
+
+@unittest.skipUnless(os.environ.get("OBFUS_REACT_SRC") and shutil.which("node"), "set OBFUS_REACT_SRC to an obfus-react checkout")
+class ObfusReactInteropTest(unittest.TestCase):
+    """obfus-react's engine reads what zenobfus writes, and agrees on damage."""
+
+    def bridge(self, *args):
+        import json
+        import subprocess
+
+        out = subprocess.run([os.path.join(_zt.ROOT, "scripts", "obfus-react", "run.sh"), os.environ["OBFUS_REACT_SRC"], *args],
+                             check=True, capture_output=True, text=True).stdout
+        return json.loads(out) if out.strip() else None
+
+    def test_both_directions(self):
+        d = tempfile.mkdtemp()
+        plain = fixture("plain.txt")
+        for chunk, ecc in ((700, True), (700, False), (1 << 20, False)):
+            src = os.path.join(d, "z.obfus")
+            with open(src, "wb") as f:
+                f.write(container.pack(plain, chunk, ecc))
+            self.bridge("unpack", src, os.path.join(d, "out"))
+            with open(os.path.join(d, "out"), "rb") as f:
+                self.assertEqual(f.read(), plain)
+        damaged = bytearray(fixture("ecc-chunked.txt.obfus"))
+        start, _ = list(record_spans(damaged, len(plain), 1024))[2]
+        for p in range(start + 20, start + 40):
+            damaged[p] ^= 0x55
+        damaged[30] ^= 0xFF
+        with open(os.path.join(d, "dmg"), "wb") as f:
+            f.write(damaged)
+        res = self.bridge("unpack", os.path.join(d, "dmg"), os.path.join(d, "out"))
+        mine = container.unpack(bytes(damaged))
+        self.assertEqual(res["damagedChunks"], mine.damaged)
+        with open(os.path.join(d, "out"), "rb") as f:
+            self.assertEqual(f.read(), mine.data)
+        shutil.rmtree(d)
 
 FIXTURE_PNG = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x03\x00\x00\x00\x02\x08\x02\x00\x00\x00"
@@ -199,6 +382,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
 
     async def test_obfuscate_a_copy(self):
         await self.click("plain.txt", "pack")
+        await self.until(lambda: "With ECC" in str(self.last().get("actions")))
+        await self.click_last("bare")
         await self.until(lambda: self.server.inputs)
         self.assertEqual(self.server.inputs[-1]["text"], "plain.txt.obfus")
         await self.type("plain.txt.obfus")
@@ -207,6 +392,56 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         with open(target, "rb") as f:
             self.assertEqual(obfus.unpack(f.read()), b"plain")
         self.assertTrue(os.path.exists(os.path.join(self.dir, "plain.txt")))
+
+    async def test_obfuscate_with_ecc(self):
+        await self.click("plain.txt", "pack")
+        await self.until(lambda: "With ECC" in str(self.last().get("actions")))
+        await self.click_last("ecc")
+        await self.until(lambda: self.server.inputs)
+        await self.type("plain.ecc.obfus")
+        target = os.path.join(self.dir, "plain.ecc.obfus")
+        await self.until(lambda: os.path.exists(target))
+        with open(target, "rb") as f:
+            blob = f.read()
+        self.assertTrue(container.is_container(blob))
+        self.assertEqual(container.unpack(blob).data, b"plain")
+        await self.until(lambda: any("plain.ecc.obfus" in t and "[obfus ecc]" in t for t in self.texts()))
+
+    async def test_damaged_container_preview_and_repaired_copy(self):
+        d = bytearray(fixture("ecc-chunked.txt.obfus"))
+        d[0] ^= 0xFF
+        start, _ = list(record_spans(d, len(fixture("plain.txt")), 1024))[4]
+        d[start + 50] ^= 0x11
+        with open(os.path.join(self.dir, "hurt.txt.obfus"), "wb") as f:
+            f.write(d)
+        await self.server.panel_action(self.panel_id(), self.messages()[0][0], "refresh")
+        await self.until(lambda: any("hurt.txt.obfus" in t and "[obfus ecc]" in t for t in self.texts()))
+        await self.click("hurt.txt.obfus", "preview")
+        await self.until(lambda: "repaired 2 byte(s) incl. the header" in self.last()["text"])
+        self.assertIn("ECC container, RS(255,243), 9 chunk(s)", self.last()["text"])
+        self.assertIn("repair", [a["id"] for a in self.last()["actions"]])
+        await self.click_last("repair")
+        await self.until(lambda: self.server.inputs)
+        self.assertEqual(self.server.inputs[-1]["text"], "hurt.txt.repaired.obfus")
+        await self.type("hurt.txt.repaired.obfus")
+        target = os.path.join(self.dir, "hurt.txt.repaired.obfus")
+        await self.until(lambda: os.path.exists(target))
+        with open(target, "rb") as f:
+            u = container.unpack(f.read())
+        self.assertEqual((u.data, u.repaired), (fixture("plain.txt"), 0))
+
+    async def test_unrepairable_chunks_are_reported(self):
+        d = bytearray(fixture("ecc-chunked.txt.obfus"))
+        start, _ = list(record_spans(d, len(fixture("plain.txt")), 1024))[1]
+        for p in range(start + 10, start + 30):
+            d[p] ^= 0x55
+        with open(os.path.join(self.dir, "dead.txt.obfus"), "wb") as f:
+            f.write(d)
+        await self.server.panel_action(self.panel_id(), self.messages()[0][0], "refresh")
+        await self.until(lambda: any("dead.txt.obfus" in t for t in self.texts()))
+        await self.click("dead.txt.obfus", "save")
+        await self.until(lambda: self.server.inputs)
+        self.assertIn("1 chunk(s) couldn't be repaired", self.last()["text"])
 
     async def test_unpack_refuses_silent_overwrite(self):
         with open(os.path.join(self.dir, "note.txt"), "w") as f:

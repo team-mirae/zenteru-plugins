@@ -26,6 +26,7 @@ import os
 from typing import Optional
 
 MAGIC = b"\x93\x51obf1"
+MAGIC_LEN = len(MAGIC)
 KEYBITS = 4
 KEYSPACE = 1 << KEYBITS
 EXT = ".obfus"
