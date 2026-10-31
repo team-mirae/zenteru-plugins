@@ -1,0 +1,92 @@
+name: live
+
+# Tests every push and pull request. On main, also rebuilds the live channel:
+# the GitHub release `live` (tag moved to the built commit) holds one
+# tarball per plugin, zenman and index.json. Only the newest build is
+# served; older versions are reachable only through git history
+# (`zenman link` a checkout).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            python: "3.13"
+          - os: ubuntu-latest   # GNU find/stat path of zenfinder's remote listing
+            python: "3.11"      # the oldest Python zenteru supports
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: team-mirae/zenteru
+          path: _zenteru
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Build check
+        run: python3 scripts/build_live.py dist
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: python3 scripts/build_live.py dist --commit "$GITHUB_SHA"
+      - name: Release notes
+        run: |
+          python3 - <<'PY' > notes.md
+          import json
+          idx = json.load(open("dist/index.json"))
+          c = idx["commit"]
+          print(f"Live build of [`{c[:10]}`](https://github.com/{idx['repo']}/commit/{c}), {idx['built']}.\n")
+          print("Only the newest build is served. Install with `zenman`:\n")
+          print("```sh\ncurl -fsSL https://raw.githubusercontent.com/team-mirae/zenteru-plugins/main/install.sh | sh\nzenman install zenfinder\n```\n")
+          print("| plugin | version | sha256 |\n|---|---|---|")
+          for p in idx["plugins"]:
+              print(f"| {p['name']} | {p['version']} | `{p['sha256'][:16]}…` |")
+          print(f"| zenman | {idx['zenman']['version']} | `{idx['zenman']['sha256'][:16]}…` |")
+          print("\nFor an older version: clone the repository, check out the commit and `zenman link <dir>`.")
+          PY
+      - name: Publish the live release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git tag -f live "$GITHUB_SHA"
+          git push -f origin refs/tags/live
+          if ! gh release view live >/dev/null 2>&1; then
+            gh release create live --title "live" --notes-file notes.md --latest=false
+          fi
+          # Archives first, the index last, so a client never sees an index
+          # pointing at archives that aren't there yet.
+          find dist -type f ! -name index.json -print0 | xargs -0 gh release upload live --clobber
+          gh release upload live dist/index.json --clobber
+          for a in $(gh release view live --json assets -q '.assets[].name'); do
+            [ -e "dist/$a" ] || gh release delete-asset live "$a" -y
+          done
+          gh release edit live --title "live (${GITHUB_SHA:0:10})" --notes-file notes.md

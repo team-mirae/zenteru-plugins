@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""zenman — install and update zenteru plugins from team-mirae/zenteru-plugins.
+
+    zenman list                    what's available, and what's installed
+    zenman install NAME… | --all   install plugins
+    zenman update [NAME…]          update installed plugins (all by default)
+    zenman remove NAME…            uninstall
+    zenman info NAME               details of one plugin
+    zenman link PATH [--force]     use a plugin from a local checkout (development, old versions)
+    zenman self-update             update zenman itself
+
+Only the **live** channel is served: the GitHub release ``live`` of
+team-mirae/zenteru-plugins always holds the newest build of every plugin,
+rebuilt by GitHub Actions on each push to ``main``. There are no old
+versions to download. For an older one, clone the repository, check out
+the commit you want and link the plugin directory:
+
+    git clone https://github.com/team-mirae/zenteru-plugins
+    git -C zenteru-plugins checkout <commit>
+    zenman link zenteru-plugins/zenfinder
+
+Plugins go to ~/Library/Application Support/zenteru/plugins/<name>.
+zenteru starts plugins when it launches, so quit and reopen it after
+installing or updating.
+
+Environment: ZENMAN_INDEX (index URL), ZENTERU_PLUGINS_DIR (install dir).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Optional
+
+__version__ = "0.1.0"
+
+REPO = "team-mirae/zenteru-plugins"
+CHANNEL = "live"
+DEFAULT_BASE = f"https://github.com/{REPO}/releases/download/{CHANNEL}/"
+RECEIPT = ".zenman.json"
+USER_AGENT = f"zenman/{__version__}"
+MAX_DOWNLOAD = 64 * 1024 * 1024
+
+
+class ZenmanError(Exception):
+    pass
+
+
+def say(msg: str) -> None:
+    print(f"zenman: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# locations
+
+
+def index_url() -> str:
+    return os.environ.get("ZENMAN_INDEX") or DEFAULT_BASE + "index.json"
+
+
+def asset_url(index_location: str, asset: str) -> str:
+    base = index_location.rsplit("/", 1)[0] + "/"
+    return base + asset
+
+
+def plugins_dir() -> str:
+    d = os.environ.get("ZENTERU_PLUGINS_DIR")
+    if d:
+        return os.path.expanduser(d)
+    return os.path.expanduser("~/Library/Application Support/zenteru/plugins")
+
+
+# ---------------------------------------------------------------------------
+# fetching
+
+
+def fetch(url: str, limit: int = MAX_DOWNLOAD) -> bytes:
+    if url.startswith("file://") or os.path.isabs(url):
+        path = url[len("file://"):] if url.startswith("file://") else url
+        with open(path, "rb") as f:
+            return f.read(limit + 1)
+    if not url.startswith("https://"):
+        raise ZenmanError(f"refusing a non-https URL: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read(limit + 1)
+    except urllib.error.HTTPError as e:
+        raise ZenmanError(f"{url}: HTTP {e.code}") from e
+    except (urllib.error.URLError, OSError) as e:
+        raise ZenmanError(f"{url}: {getattr(e, 'reason', e)}") from e
+    if len(data) > limit:
+        raise ZenmanError(f"{url}: larger than {limit} bytes")
+    return data
+
+
+def load_index(url: Optional[str] = None) -> dict:
+    url = url or index_url()
+    try:
+        idx = json.loads(fetch(url, 4 * 1024 * 1024))
+    except ValueError as e:
+        raise ZenmanError(f"{url}: not a valid index") from e
+    if not isinstance(idx, dict) or idx.get("schema") != 1 or not isinstance(idx.get("plugins"), list):
+        raise ZenmanError(f"{url}: unsupported index format")
+    idx["_url"] = url
+    return idx
+
+
+def find(idx: dict, name: str) -> dict:
+    for p in idx["plugins"]:
+        if p.get("name") == name:
+            return p
+    names = ", ".join(p.get("name", "?") for p in idx["plugins"])
+    raise ZenmanError(f"no plugin named {name!r} (available: {names})")
+
+
+def download_verified(idx: dict, entry: dict) -> bytes:
+    data = fetch(asset_url(idx["_url"], entry["asset"]))
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != entry.get("sha256"):
+        raise ZenmanError(f"{entry['asset']}: checksum mismatch (got {digest[:12]}…, want {str(entry.get('sha256'))[:12]}…)")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# installed state
+
+
+def receipt_of(path: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(path, RECEIPT), encoding="utf-8") as f:
+            r = json.load(f)
+        return r if isinstance(r, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def installed() -> dict[str, dict]:
+    """name -> {"path", "kind": managed|linked|manual, "receipt", "manifest"}."""
+    out: dict[str, dict] = {}
+    d = plugins_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for n in names:
+        p = os.path.join(d, n)
+        if n.startswith(".") or not os.path.isdir(p):
+            continue
+        manifest = None
+        try:
+            with open(os.path.join(p, "plugin.json"), encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if os.path.islink(p):
+            kind = "linked"
+        elif receipt_of(p) is not None:
+            kind = "managed"
+        else:
+            kind = "manual"
+        out[n] = {"path": p, "kind": kind, "receipt": receipt_of(p), "manifest": manifest}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# unpacking
+
+
+def safe_extract(data: bytes, dest: str, name: str) -> None:
+    """Extract a plugin tarball whose members all live under ``name/``."""
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        members = tf.getmembers()
+        for m in members:
+            parts = m.name.split("/")
+            if parts[0] != name or ".." in parts or m.name.startswith("/") or "\\" in m.name:
+                raise ZenmanError(f"unsafe path in archive: {m.name!r}")
+            if not (m.isfile() or m.isdir()):
+                raise ZenmanError(f"unsupported member in archive: {m.name!r}")
+        for m in members:
+            target = os.path.join(dest, *m.name.split("/"))
+            if m.isdir():
+                os.makedirs(target, mode=0o755, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+            src = tf.extractfile(m)
+            assert src is not None
+            with open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+            os.chmod(target, 0o755 if m.mode & stat.S_IXUSR else 0o644)
+
+
+def install_one(idx: dict, entry: dict, force: bool = False) -> str:
+    name = entry["name"]
+    root = plugins_dir()
+    os.makedirs(root, exist_ok=True)
+    dest = os.path.join(root, name)
+    if os.path.islink(dest):
+        if not force:
+            raise ZenmanError(f"{name} is linked to {os.readlink(dest)}; `zenman remove {name}` first or use --force")
+        os.unlink(dest)
+    elif os.path.exists(dest) and receipt_of(dest) is None and not force:
+        raise ZenmanError(f"{dest} exists and wasn't installed by zenman; use --force to replace it")
+    data = download_verified(idx, entry)
+    staging = tempfile.mkdtemp(prefix=f".{name}-", dir=root)
+    try:
+        safe_extract(data, staging, name)
+        new = os.path.join(staging, name)
+        try:
+            with open(os.path.join(new, "plugin.json"), encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError) as e:
+            raise ZenmanError(f"{name}: archive has no valid plugin.json") from e
+        if manifest.get("name") != name:
+            raise ZenmanError(f"{name}: archive is for {manifest.get('name')!r}")
+        receipt = {
+            "name": name,
+            "version": entry.get("version"),
+            "sha256": entry.get("sha256"),
+            "commit": idx.get("commit"),
+            "channel": CHANNEL,
+            "installed": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "source": idx["_url"],
+        }
+        with open(os.path.join(new, RECEIPT), "w", encoding="utf-8") as f:
+            json.dump(receipt, f, indent=2)
+            f.write("\n")
+        old = None
+        if os.path.exists(dest):
+            old = os.path.join(staging, "old")
+            os.rename(dest, old)
+        os.rename(new, dest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+
+def state_label(info: Optional[dict], entry: Optional[dict]) -> str:
+    if info is None:
+        return "-"
+    if info["kind"] == "linked":
+        return f"linked → {os.readlink(info['path'])}"
+    if info["kind"] == "manual":
+        v = (info.get("manifest") or {}).get("version") or "?"
+        return f"{v} (not managed by zenman)"
+    r = info["receipt"] or {}
+    label = str(r.get("version") or "?")
+    if entry is not None and r.get("sha256") != entry.get("sha256"):
+        label += f" → {entry.get('version')} available"
+    return label
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    idx = load_index(args.index)
+    inst = installed()
+    rows = [("NAME", "LIVE", "INSTALLED", "DESCRIPTION")]
+    for p in idx["plugins"]:
+        rows.append((p["name"], str(p.get("version", "?")), state_label(inst.get(p["name"]), p), p.get("description", "")))
+    known = {p["name"] for p in idx["plugins"]}
+    for n, info in inst.items():
+        if n not in known and info["kind"] != "manual":
+            rows.append((n, "-", state_label(info, None), "(not in the live index)"))
+    w0 = max(len(r[0]) for r in rows)
+    w1 = max(len(r[1]) for r in rows)
+    w2 = max(len(r[2]) for r in rows)
+    for r in rows:
+        desc = r[3] if len(r[3]) <= 70 else r[3][:69] + "…"
+        print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]:<{w2}}  {desc}".rstrip())
+    print(f"\nlive build {str(idx.get('commit', '?'))[:10]} ({idx.get('built', '?')})")
+    return 0
+
+
+def restart_hint(changed: list[str]) -> None:
+    if changed:
+        say("quit and reopen zenteru to load " + ", ".join(changed))
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    idx = load_index(args.index)
+    names = [p["name"] for p in idx["plugins"]] if args.all else args.names
+    if not names:
+        raise ZenmanError("name a plugin, or use --all")
+    changed = []
+    for n in names:
+        entry = find(idx, n)
+        info = installed().get(n)
+        if info and info["kind"] == "linked" and args.all and not args.force:
+            say(f"{n} is linked to a checkout; skipping")
+            continue
+        if info and info["kind"] == "managed" and (info["receipt"] or {}).get("sha256") == entry.get("sha256") and not args.force:
+            say(f"{n} {entry.get('version')} is already installed")
+            continue
+        path = install_one(idx, entry, force=args.force)
+        say(f"installed {n} {entry.get('version')} to {path}")
+        changed.append(n)
+    restart_hint(changed)
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    idx = load_index(args.index)
+    inst = installed()
+    names = args.names or [n for n, i in inst.items() if i["kind"] == "managed"]
+    changed = []
+    for n in names:
+        info = inst.get(n)
+        if info is None:
+            raise ZenmanError(f"{n} isn't installed (use `zenman install {n}`)")
+        if info["kind"] == "linked":
+            say(f"{n} is linked to a checkout; update it with git")
+            continue
+        if info["kind"] == "manual":
+            say(f"{n} wasn't installed by zenman; skipping (`zenman install --force {n}` takes it over)")
+            continue
+        try:
+            entry = find(idx, n)
+        except ZenmanError:
+            say(f"{n} is no longer in the live index; keeping it")
+            continue
+        if (info["receipt"] or {}).get("sha256") == entry.get("sha256"):
+            say(f"{n} is up to date ({entry.get('version')})")
+            continue
+        install_one(idx, entry)
+        say(f"updated {n} to {entry.get('version')}")
+        changed.append(n)
+    restart_hint(changed)
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    inst = installed()
+    for n in args.names:
+        info = inst.get(n)
+        if info is None:
+            raise ZenmanError(f"{n} isn't installed")
+        if info["kind"] == "linked":
+            os.unlink(info["path"])
+            say(f"unlinked {n} (the checkout is untouched)")
+        elif info["kind"] == "managed" or args.force:
+            shutil.rmtree(info["path"])
+            say(f"removed {n}")
+        else:
+            raise ZenmanError(f"{info['path']} wasn't installed by zenman; use --force to delete it")
+    if args.names:
+        say("quit and reopen zenteru to stop the removed plugin(s)")
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    idx = load_index(args.index)
+    p = find(idx, args.name)
+    info = installed().get(args.name)
+    print(f"{p['name']} {p.get('version')} — {p.get('title', '')}")
+    print(p.get("description", ""))
+    print(f"\n  live build   {str(idx.get('commit', '?'))[:10]} ({idx.get('built', '?')})")
+    print(f"  archive      {p.get('asset')} ({p.get('size')} bytes, sha256 {str(p.get('sha256'))[:16]}…)")
+    print(f"  installed    {state_label(info, p)}")
+    print(f"  source       https://github.com/{REPO}/tree/{idx.get('commit', 'main')}/{p['name']}")
+    return 0
+
+
+def cmd_link(args: argparse.Namespace) -> int:
+    src = os.path.abspath(os.path.expanduser(args.path))
+    try:
+        with open(os.path.join(src, "plugin.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ZenmanError(f"{src} has no valid plugin.json") from e
+    name = manifest.get("name")
+    if not isinstance(name, str) or not name or "/" in name or name.startswith("."):
+        raise ZenmanError(f"{src}/plugin.json has no usable name")
+    root = plugins_dir()
+    os.makedirs(root, exist_ok=True)
+    dest = os.path.join(root, name)
+    if os.path.lexists(dest):
+        if os.path.islink(dest) and os.path.realpath(dest) == os.path.realpath(src):
+            say(f"{name} is already linked to {src}")
+            return 0
+        if not args.force:
+            raise ZenmanError(f"{dest} exists; use --force to replace it with a link")
+        if os.path.islink(dest) or os.path.isfile(dest):
+            os.unlink(dest)
+        else:
+            shutil.rmtree(dest)
+    os.symlink(src, dest)
+    say(f"linked {name} → {src}")
+    restart_hint([name])
+    return 0
+
+
+def cmd_self_update(args: argparse.Namespace) -> int:
+    idx = load_index(args.index)
+    z = idx.get("zenman")
+    if not isinstance(z, dict):
+        raise ZenmanError("the live index has no zenman build")
+    if z.get("version") == __version__ and not args.force:
+        me = os.path.realpath(sys.argv[0])
+        try:
+            with open(me, "rb") as f:
+                if hashlib.sha256(f.read()).hexdigest() == z.get("sha256"):
+                    say(f"zenman {__version__} is up to date")
+                    return 0
+        except OSError:
+            pass
+    data = download_verified(idx, z)
+    me = os.path.realpath(sys.argv[0])
+    tmp = me + ".new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, me)
+    say(f"updated zenman to {z.get('version')} ({me})")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="zenman", description="Install and update zenteru plugins (live channel).",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="Old versions aren't served; see `zenman link --help`.")
+    p.add_argument("--version", action="version", version=f"zenman {__version__}")
+    p.add_argument("--index", help="index URL (default: the live release)")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.add_parser("list", aliases=["ls"], help="available and installed plugins").set_defaults(func=cmd_list)
+    s = sub.add_parser("install", aliases=["i"], help="install plugins")
+    s.add_argument("names", nargs="*")
+    s.add_argument("--all", action="store_true", help="every plugin in the index")
+    s.add_argument("--force", action="store_true", help="reinstall, or replace a plugin zenman didn't install")
+    s.set_defaults(func=cmd_install)
+    s = sub.add_parser("update", aliases=["up", "upgrade"], help="update installed plugins")
+    s.add_argument("names", nargs="*")
+    s.set_defaults(func=cmd_update)
+    s = sub.add_parser("remove", aliases=["rm", "uninstall"], help="uninstall plugins")
+    s.add_argument("names", nargs="+")
+    s.add_argument("--force", action="store_true", help="also delete plugins zenman didn't install")
+    s.set_defaults(func=cmd_remove)
+    s = sub.add_parser("info", help="details of one plugin")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_info)
+    s = sub.add_parser(
+        "link", help="use a plugin directory from a local checkout",
+        description="Symlink a plugin directory (with plugin.json) into zenteru's plugins folder. "
+                    "Use this for development and for old versions: git clone "
+                    f"https://github.com/{REPO}, check out the commit you want, then "
+                    "`zenman link zenteru-plugins/<name>`.",
+    )
+    s.add_argument("path")
+    s.add_argument("--force", action="store_true", help="replace an installed copy")
+    s.set_defaults(func=cmd_link)
+    s = sub.add_parser("self-update", help="update zenman itself")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_self_update)
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    try:
+        return args.func(args)
+    except ZenmanError as e:
+        print(f"zenman: error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

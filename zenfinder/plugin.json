@@ -1,0 +1,8 @@
+{
+  "name": "zenfinder",
+  "title": "zenfinder — file browser",
+  "version": "0.1.0",
+  "description": "Side-panel file browser for the session's directory, local or over ssh, with drag-and-drop upload and paste-as-file.",
+  "entry": "main.py",
+  "autostart": true
+}

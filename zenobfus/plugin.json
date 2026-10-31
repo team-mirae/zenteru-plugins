@@ -1,0 +1,8 @@
+{
+  "name": "zenobfus",
+  "title": "zenobfus — obfus browser",
+  "version": "0.1.0",
+  "description": "Side-panel browser that unpacks .obfus files (file-obfuscation format) in memory and previews them, archives included.",
+  "entry": "main.py",
+  "autostart": true
+}
