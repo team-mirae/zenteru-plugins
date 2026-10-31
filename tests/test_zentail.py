@@ -70,6 +70,37 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(ts.parse_accounts("garbage"), [])
 
 
+class SshTargetTest(unittest.TestCase):
+    """The ssh destination follows the name the user's ssh config knows."""
+
+    def configs(self, known):
+        base = {"user": "me", "port": "22"}
+        return lambda name: dict(base, user="ec2-user") if name in known else dict(base)
+
+    def peer(self):
+        return ts.Peer("p", "web", "web.tail.example.", ["100.64.0.5"], "linux", True)
+
+    def test_short_name_stanza(self):
+        with mock.patch.object(ts, "_ssh_G", self.configs({"web"})):
+            self.assertEqual(ts.ssh_destination(self.peer()), "web")
+
+    def test_fqdn_stanza(self):
+        with mock.patch.object(ts, "_ssh_G", self.configs({"web.tail.example"})):
+            self.assertEqual(ts.ssh_destination(self.peer()), "web.tail.example")
+
+    def test_no_stanza_uses_magicdns(self):
+        with mock.patch.object(ts, "_ssh_G", self.configs(set())):
+            self.assertEqual(ts.ssh_destination(self.peer()), "web.tail.example")
+
+    def test_command_keeps_failed_tabs_open(self):
+        import subprocess
+
+        out = subprocess.run(["/bin/sh", "-c", ts.ssh_command("x").replace("ssh x", "false", 1)],
+                             input="\n", capture_output=True, text=True).stdout
+        self.assertIn("ssh exited with status 1", out)
+        self.assertEqual(ts.ssh_command("h", "u").split(";")[0], "ssh -l u h")
+
+
 class LauncherTest(unittest.TestCase):
     def test_install_and_refuse_foreign_file(self):
         d = tempfile.mkdtemp()
@@ -128,7 +159,8 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
             json.dump(STATUS, f)
         self.log = os.path.join(self.tmp, "log")
         self.envp = mock.patch.dict(os.environ, {"ZENTAIL_TAILSCALE": cli, "FAKE_TS_STATUS": self.status_file,
-                                                  "FAKE_TS_LOG": self.log})
+                                                  "FAKE_TS_LOG": self.log,
+                                                  "ZENTAIL_DATA_DIR": os.path.join(self.tmp, "data")})
         self.envp.start()
         self.plugin = ZenTail(self.conn)
         await self.plugin.async_register()
@@ -167,7 +199,22 @@ class PanelTest(_zt.PanelTest if _zt.HAVE_ZENTERU else unittest.TestCase):
         await self.until(lambda: self.server.clipboard == "100.64.0.5")
         await self.click("● web", "ssh")
         await self.until(lambda: any(m == "tab.create" for m, _ in self.server.calls))
-        self.assertEqual(self.server.last_call("tab.create")["command"], "ssh web.tail.example")
+        cmd = self.server.last_call("tab.create")["command"]
+        self.assertTrue(cmd.startswith("ssh web.tail.example; s=$?;"), cmd)
+        self.assertIn("read _", cmd)  # a failed login keeps the tab open
+
+    async def test_ssh_as_remembers_the_user(self):
+        await self.open()
+        await self.click("● web", "sshas")
+        await self.until(lambda: "as which user" in self.last()["text"])
+        await self.type("ec2-user")
+        await self.until(lambda: any(m == "tab.create" for m, _ in self.server.calls))
+        self.assertTrue(self.server.last_call("tab.create")["command"].startswith("ssh -l ec2-user web.tail.example;"))
+        self.assertEqual(json.load(open(os.path.join(self.tmp, "data", "ssh-users.json"))), {"web": "ec2-user"})
+        n = len(self.server.calls)
+        await self.click("● web", "ssh")
+        await self.until(lambda: any(m == "tab.create" for m, _ in self.server.calls[n:]))
+        self.assertTrue(self.server.last_call("tab.create")["command"].startswith("ssh -l ec2-user "))
 
     async def test_exit_node_asks_first(self):
         await self.open()

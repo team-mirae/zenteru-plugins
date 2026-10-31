@@ -258,3 +258,62 @@ def install_launcher(binary: str, bin_dir: str = "~/.local/bin", replace: bool =
 
 
 INTERACTIVE = {"login", "ssh", "up", "update", "web", "serve", "funnel", "nc", "configure", "lock", "bugreport"}
+
+
+# ---------------------------------------------------------------------------
+# ssh to a peer
+
+#: A name no ssh_config stanza should match: its effective config is the baseline.
+_BASELINE_HOST = "zentail-no-such-host.invalid"
+_IGNORED_KEYS = {"hostname", "host", "proxycommand", "localcommand"}
+
+
+def _ssh_G(name: str) -> dict[str, str]:
+    import subprocess
+
+    try:
+        out = subprocess.run(["ssh", "-G", name], capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    cfg: dict[str, str] = {}
+    for line in out.splitlines():
+        k, _, v = line.partition(" ")
+        if k and k not in _IGNORED_KEYS:
+            cfg.setdefault(k.lower(), v)
+    return cfg
+
+
+def config_matches(name: str, baseline: Optional[dict[str, str]] = None) -> bool:
+    """Does a ``Host`` stanza in the user's ssh config apply to ``name``?"""
+    base = baseline if baseline is not None else _ssh_G(_BASELINE_HOST)
+    cfg = _ssh_G(name)
+    return bool(cfg) and cfg != base
+
+
+def ssh_destination(peer: "Peer") -> str:
+    """The name to ssh to: the one the user's ssh config knows, if any.
+
+    People write ``Host web`` (the short name) in ~/.ssh/config far more
+    often than the MagicDNS name. ssh only applies a stanza whose pattern
+    matches the name given on the command line, so passing the wrong one
+    loses the configured User/IdentityFile and the login fails.
+    """
+    candidates = [c for c in (peer.host, peer.short_dns) if c]
+    base = _ssh_G(_BASELINE_HOST)
+    for c in candidates:
+        if config_matches(c, base):
+            return c
+    return peer.short_dns or peer.ipv4 or peer.host
+
+
+def ssh_command(dest: str, user: Optional[str] = None) -> str:
+    """A shell command that runs ssh and keeps the tab open if it fails."""
+    import shlex
+
+    argv = ["ssh"] + (["-l", user] if user else []) + [dest]
+    return (
+        f"{shlex.join(argv)}; s=$?; "
+        f"if [ $s -ne 0 ] && [ $s -ne 130 ]; then echo; echo \"zentail: ssh exited with status $s\"; "
+        "printf 'Press Enter to close this tab. '; read _; fi"
+    )

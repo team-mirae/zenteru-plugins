@@ -7,13 +7,20 @@ Tailscale in a zenteru side panel. Open it with `@zentail` or from the ⌘⇧P p
   (Disconnect asks first), Exit node off, Netcheck and Accounts
   (`tailscale switch`).
 - **Rows:** one per peer: online state, IPv4, OS, direct or relayed, and
-  traffic. Each has **SSH** (a new tab running `ssh <magicdns-name>`),
+  traffic. Each has **SSH**, **SSH as…** (asks for a user and remembers it
+  for that peer),
   **Ping** (`tailscale ping -c 3`), **Copy IP**, and **Use as exit node**
   (asks first, with or without LAN access).
 - **Bottom:** command output.
 - **Input box:** runs `tailscale <what you type>`, e.g. `ping neo`,
   `dns status`, `get`. Commands that need a terminal (`login`, `ssh`, `up`,
   `serve`, …) open in a new tab instead.
+
+**SSH** opens a new tab running ssh to the name your `~/.ssh/config` knows.
+ssh applies a `Host` stanza only to the name typed, so zentail checks with
+`ssh -G` whether a stanza matches the peer's short name (`Host web`) or its
+MagicDNS name, and uses that one; otherwise it uses the MagicDNS name. If
+ssh fails, the tab stays open to show why.
 
 The panel refreshes every 5 s while it's open, and redraws only when
 something changed.

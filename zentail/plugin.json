@@ -1,7 +1,7 @@
 {
   "name": "zentail",
   "title": "zentail — Tailscale",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tailscale in a side panel: status, peers, SSH, ping, exit nodes and accounts, using the Tailscale app's own CLI.",
   "entry": "main.py",
   "autostart": true

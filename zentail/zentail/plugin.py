@@ -13,6 +13,7 @@ the input box runs as ``tailscale <what you typed>`` (``ping neo``,
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -62,9 +63,33 @@ class ZenTail:
         self.connection = connection
         self.views: dict[Optional[str], View] = {}
         self.cli: Optional[ts.Cli] = None
+        #: peer host name -> ssh user chosen with "SSH as…"
+        self.ssh_users: dict[str, str] = self.load_users()
         self.commands = [
             Command("zentail: show / hide Tailscale", self.cmd_toggle, identifier="zentail.toggle", name="zentail"),
         ]
+
+    @staticmethod
+    def users_path() -> str:
+        d = os.environ.get("ZENTAIL_DATA_DIR") or os.path.expanduser(
+            "~/Library/Application Support/zenteru/plugin-data/zentail")
+        return os.path.join(d, "ssh-users.json")
+
+    def load_users(self) -> dict[str, str]:
+        try:
+            with open(self.users_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+
+    def save_users(self) -> None:
+        path = self.users_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.ssh_users, f, indent=2)
+        os.replace(tmp, path)
 
     async def async_register(self) -> None:
         for c in self.commands:
@@ -182,7 +207,7 @@ class ZenTail:
 
     @staticmethod
     def peer_actions(st: ts.Status, p: ts.Peer) -> list[tuple[str, str]]:
-        acts = [("ssh", "SSH"), ("ping", "Ping"), ("copy", "Copy IP")]
+        acts = [("ssh", "SSH"), ("sshas", "SSH as…"), ("ping", "Ping"), ("copy", "Copy IP")]
         if p.exit_node:
             acts.append(("exitoff", "Stop using as exit"))
         elif p.exit_option and p.online:
@@ -297,7 +322,29 @@ class ZenTail:
             return
         target = p.short_dns or p.ipv4
         if a == "ssh":
-            await self.new_tab(v, f"ssh {shlex.quote(target)}")
+            dest = await asyncio.to_thread(ts.ssh_destination, p)
+            await self.new_tab(v, ts.ssh_command(dest, self.ssh_users.get(p.host)))
+        elif a == "sshas":
+            dest = await asyncio.to_thread(ts.ssh_destination, p)
+            current = self.ssh_users.get(p.host) or ""
+            ans = await v.bp.ask(
+                f"SSH to {dest} as which user? zentail remembers it for {p.host}.\n"
+                "Leave it empty to use your ssh config's user again.",
+                [("cancel", "Cancel")], prefill=current)
+            if ans is None or ans[0] == "action":
+                await v.bp.clear_preview()
+                return
+            user = ans[1].strip()
+            if user and not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]*", user):
+                await v.panel.async_set_status(f"{user!r} isn't a user name")
+                return
+            if user:
+                self.ssh_users[p.host] = user
+            else:
+                self.ssh_users.pop(p.host, None)
+            self.save_users()
+            await v.bp.clear_preview()
+            await self.new_tab(v, ts.ssh_command(dest, user or None))
         elif a == "ping":
             await self.run_shown(v, ["ping", "-c", "3", p.ipv4 or target], timeout=40)
         elif a == "copy" and p.ipv4:
